@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# manman — Manager Master（最上位統合ダッシュボード）
+# portmap / nodeman / serverman を束ねて一元管理する。
+# 日本語ユーザ向けに出力は日本語。
+#
+#   manman ls                 全統合ダッシュボード（ポート + PID + 状態 + スキル）
+#   manman ps                 全プロセス一覧（node 中心 + Windows）
+#   manman ports              ポート占用状況
+#   manman servers            登録スキルサーバー状態
+#   manman start <skill>      スキル起動（serverman 経由）
+#   manman stop <skill|port|pid>  停止
+#   manman restart <skill>    再起動
+#   manman open <skill>       ブラウザで開く
+#   manman clean              移設済み元ディレクトリの削除（1028 / hokusai-manga 等）
+#   manman gc                 ゴミ集め / 一時ファイル削除
+#   manman health             全スキル生存確認
+#   manman win-check          C:\Users\0501JP\ 直下の残存ディレクトリを確認
+#   manman register <name> <port> <dir> <cmd> [url]  新規スキル登録
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PM="${SCRIPT_DIR}/../portmanager"
+GREEN=$'\e[32m'; RED=$'\e[31m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'; RESET=$'\e[m'
+
+# ── 補助関数 ──────────────────────────────────
+_win_cmd() { powershell.exe -NoProfile -Command "$1" 2>/dev/null | tr -d '\r'; }
+_pid_by_port() { _win_cmd "\$conn=Get-NetTCPConnection -LocalPort $1 -EA SilentlyContinue; if(\$conn){\$conn.OwningProcess}else{0}"; }
+_mem_by_pid() { _win_cmd "if(\$p=Get-Process -Id $1 -EA SilentlyContinue){[math]::Round(\$p.WorkingSet/1MB,1)}else{0}"; }
+
+# ── ls ────────────────────────────────────────
+cmd_ls() {
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║             manman — 最上位統合ダッシュボード               ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  # ─ node.exe 一覧 ─
+  echo "━━━━━━━━━ Node.exe プロセス ━━━━━━━━━"
+  _win_cmd '
+    Get-Process -Name node -EA SilentlyContinue |
+    Select-Object Id,
+      @{N="MemMB";E={[math]::Round($_.WorkingSet/1MB,1)}},
+      @{N="Cmd";E={
+        $c=(Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
+        if($c.Length-gt55){$c.Substring(0,52)+"..."}else{$c}
+      }} |
+    Format-Table -AutoSize
+  '
+  echo ""
+
+  # ─ serverman skills ─
+  [ -x "${PM}/serverman" ] && {
+    echo "━━━━━━━━━ 登録スキルサーバー ━━━━━━━━━"
+    "${PM}/serverman" ls 2>/dev/null || true
+    echo ""
+  }
+
+  # ─ portmap ports ─
+  [ -x "${PM}/portmap" ] && {
+    echo "━━━━━━━━━ ポートマッピング ━━━━━━━━━"
+    "${PM}/portmap" ports 2>/dev/null || true
+    echo ""
+  }
+
+  echo "━━━━━━━━━ 空いているポート（上位候補） ━━━━━━━━━"
+  "${PM}/portmap" find-free 8000 9000 2>/dev/null || true
+  echo ""
+}
+
+# ── ps ────────────────────────────────────────
+cmd_ps() {
+  echo "=== Node.exe + Python + Web サーバ プロセス ==="
+  _win_cmd '
+    Get-Process |
+    Where-Object { $_.ProcessName -in @("node","python","python3","httpd","nginx") } |
+    Select-Object Id, ProcessName,
+      @{N="MemMB";E={[math]::Round($_.WorkingSet/1MB,1)}},
+      @{N="Start";E={$_.StartTime.ToString("HH:mm")}},
+      @{N="Cmd";E={
+        $c=(Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
+        if($c -and $c.Length-gt55){$c.Substring(0,52)+"..."}else{$c}
+      }} |
+    Format-Table -AutoSize
+  '
+}
+
+# ── ports ─────────────────────────────────────
+cmd_ports() {
+  [ -x "${PM}/portmap" ] && "${PM}/portmap" ports || { echo "portmap not found"; exit 1; }
+}
+
+# ── servers ───────────────────────────────────
+cmd_servers() {
+  [ -x "${PM}/serverman" ] && "${PM}/serverman" ls || { echo "serverman not found"; exit 1; }
+}
+
+# ── start / stop / restart / open ─────────────
+cmd_start()  { "${PM}/serverman" start "$@"; }
+cmd_stop()   { "${PM}/serverman" stop "$@"; }
+cmd_restart(){ "${PM}/serverman" restart "$@"; }
+cmd_open()   { "${PM}/serverman" open "$@"; }
+
+# ── health ────────────────────────────────────
+cmd_health() {
+  echo "=== Health Check ==="
+  "${PM}/serverman" health 2>/dev/null && echo "${GREEN}✅ ALL GOOD${RESET}" || echo "${RED}❌ SOME DOWN${RESET}"
+}
+
+# ── clean : 移設済み元ディレクトリの削除 ─────
+cmd_clean() {
+  # 移設済みリスト（一元管理）
+  declare -a moved=(
+    "/mnt/c/Users/0501JP/1028"
+    "/mnt/c/Users/0501JP/hokusai-manga"
+  )
+  echo "=== 移設済み元ディレクトリ掃除 ==="
+  for d in "${moved[@]}"; do
+    if [ -d "$d" ]; then
+      echo "削除対象: ${CYAN}$d${RESET}"
+      # node が停止済みか再確認
+      read -r -p "本当に削除しますか? [y/N] " ans
+      if [[ "${ans,,}" == "y" ]]; then
+        rm -rf "$d" 2>/dev/null && echo "${GREEN}  ✓ 削除完了${RESET}" || echo "${RED}  ✗ Permission denied (何かがまだロック中)${RESET}"
+      else
+        echo "  スキップ"
+      fi
+    else
+      echo "${YELLOW}✓ 既に削除済み or 存在しない: $d${RESET}"
+    fi
+  done
+}
+
+# ── gc : 一時ファイル・ゴミ集め ──────────────
+cmd_gc() {
+  echo "=== 一時ファイル・ゴミ集め ==="
+  
+  # node_modules をスキップしつつ skills 配下の tmp
+  find /mnt/c/Users/0501JP/.config/opencode/skills -maxdepth 3 -type d -name tmp -print0 2>/dev/null |
+    while IFS= read -r -d '' tmpdir; do
+      size=$(du -sh "$tmpdir" 2>/dev/null | cut -f1)
+      echo "tmp found: $tmpdir (${size})"
+    done
+
+  # npm cache
+  if command -v npm >/dev/null 2>&1; then
+    echo "npm cache verify..."
+    npm cache verify 2>/dev/null | tail -3 || true
+  fi
+  echo "${GREEN}Done${RESET}"
+}
+
+# ── win-check : Windows 側残存物チェック ─────
+cmd_win_check() {
+  echo "=== C:\Users\0501JP\ 直下の残存ディレクトリ ==="
+  # WSL から見えるパスでチェック
+  for d in /mnt/c/Users/0501JP/*/; do
+    name=$(basename "$d")
+    # 通常のユーザー系ディレクトリは除外
+    case "$name" in
+      .config|Documents|Downloads|Desktop|Music|Pictures|Videos|AppData|Local|Roaming|OneDrive|source)
+        continue ;;
+    esac
+    if [ -d "$d/.git" ] || [ -d "$d/agents" ] || [ -d "$d/tools" ] || [ -f "$d/package.json" ] || [ -d "$d/node_modules" ]; then
+      size=$(du -sh "$d" 2>/dev/null | cut -f1)
+      echo "${YELLOW}[PROJECT]  $name  (${size})${RESET}  ← スキルに登録すべき?"
+    else
+      size=$(du -sh "$d" 2>/dev/null | cut -f1)
+      echo "           $name  (${size})"
+    fi
+  done
+  echo ""
+  echo "${CYAN}ヒント: node / server を起動しているディレクトリは${RESET}"
+  echo "${CYAN}        serverman register <name> <port> <dir> <cmd> で一元管理に登録できます${RESET}"
+}
+
+# ── register ────────────────────────────────────
+cmd_register() {
+  "${PM}/serverman" register "$@"
+}
+
+# ── help ──────────────────────────────────────
+cmd_help() {
+  cat <<EOF
+${CYAN}manman — 最上位統合ダッシュボード${RESET}
+
+${YELLOW}情報表示:${RESET}
+  ls          統合ダッシュボード（node + skills + ports）
+  ps          全プロセス一覧
+  ports       ポート占用状況
+  servers     登録スキル一覧
+  health      全スキル生存確認
+
+${YELLOW}操作:${RESET}
+  start <skill>     スキル起動
+  stop <skill|port|pid>  停止
+  restart <skill>   再起動
+  open <skill>      ブラウザで開く
+
+${YELLOW}整備:${RESET}
+  clean             移設済み元ディレクトリ掃除（1028 / hokusai-manga）
+  gc                一時ファイル・npm cache 整理
+  win-check         C:\Users\0501JP\直下の残存プロジェクトチェック
+
+${YELLOW}登録:${RESET}
+  register <name> <port> <dir> <cmd> [url]
+    例: manman register myapp 8080 /home/user/myapp 'node server.js' /index.html
+
+${YELLOW}下位マネージャ:${RESET}
+  portmap   (portmanager/portmap)    ポート管理
+  nodeman   (portmanager/nodeman)    node.exe 管理
+  serverman (portmanager/serverman)  スキルサーバー管理
+EOF
+}
+
+# ── main ──────────────────────────────────────
+CMD="${1:-ls}"
+shift || true
+
+case "$CMD" in
+  ls|dashboard)     cmd_ls ;;
+  ps|process|proc)  cmd_ps ;;
+  ports|port)       cmd_ports ;;
+  servers|server)   cmd_servers ;;
+  start)            cmd_start "$@" ;;
+  stop|kill)        cmd_stop "$@" ;;
+  restart)          cmd_restart "$@" ;;
+  open)             cmd_open "$@" ;;
+  health|check)     cmd_health ;;
+  clean|rm-old)     cmd_clean ;;
+  gc|cleanup)       cmd_gc ;;
+  win-check|winc)   cmd_win_check ;;
+  register|reg)     cmd_register "$@" ;;
+  help|--help|-h)   cmd_help ;;
+  *)
+    echo "Unknown command: $CMD"
+    cmd_help
+    exit 1
+    ;;
+esac
